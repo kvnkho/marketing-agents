@@ -3,6 +3,7 @@
 Each capture file is also its durable task state. No scheduler or external queue.
 """
 import datetime
+import http.client
 import json
 import os
 import re
@@ -77,6 +78,9 @@ def extract_row(row):
         raise ValueError('Bright Data returned no answer text.')
     if any(text.startswith(marker) for marker in PROVIDER_ERRORS):
         raise ValueError('Bright Data returned a provider error page.')
+    for key in ('citations', 'search_sources', 'sources'):
+        if row.get(key) is not None and not isinstance(row[key], list):
+            raise ValueError('Bright Data returned an invalid ' + key + ' list.')
     citations = []
     for source in row.get('citations') or []:
         if isinstance(source, dict) and source.get('cited') is not False:
@@ -204,6 +208,8 @@ class Runner:
             retry_after = error.headers.get('Retry-After') if error.headers else None
             error.close()
             raise HTTPFailure(error.code, retry_after) from None
+        except http.client.HTTPException:
+            raise urllib.error.URLError('Provider connection failed.') from None
 
     def defer(self, task, error, attempts):
         delay = min(60, 5 * 2 ** (attempts - 1))
@@ -227,11 +233,6 @@ class Runner:
             # Retry the same snapshot first, before failing this collection attempt.
             task['readFailures'] = task.get('readFailures', 0) + 1
             self.defer(task, error, min(task['readFailures'], 5))
-            if task['readFailures'] >= 3:
-                self.failed_attempt(task, task['brightDataAttempts'][-1],
-                                    'Snapshot read failed after three HTTP attempts.')
-                task['readFailures'] = 0
-                self.save(task)
             return None
         task['readFailures'] = 0
         task.pop('nextAttemptAt', None)
@@ -256,17 +257,20 @@ class Runner:
             attempts = task['brightDataAttempts']
             if attempts and attempts[-1]['status'] == 'Submitted':
                 attempt = attempts[-1]
-                if time.time() - attempt['submittedAt'] >= SNAPSHOT_TIMEOUT_SECONDS:
-                    self.failed_attempt(task, attempt, 'Snapshot exceeded the 20 minute collection deadline.')
-                    continue
+                expired = time.time() - attempt['submittedAt'] >= SNAPSHOT_TIMEOUT_SECONDS
                 snapshot = urllib.parse.quote(attempt['snapshotId'], safe='')
                 if not attempt.get('ready'):
                     progress = self.get(task, route, '/progress/' + snapshot)
                     if progress is None:
+                        if expired:
+                            raise Pause('Snapshot deadline reached but progress unavailable; resume to check the saved snapshot.')
                         continue
                     attempt['progress'] = progress
                     status = progress.get('status') if isinstance(progress, dict) else None
                     if status in WAITING:
+                        if expired:
+                            self.failed_attempt(task, attempt, 'Snapshot still unfinished after the 20 minute collection deadline.')
+                            continue
                         task['nextAttemptAt'] = time.time() + self.poll_interval
                         self.save(task)
                         continue
@@ -279,8 +283,13 @@ class Runner:
                     self.save(task)
                 rows = self.get(task, route, '/snapshot/' + snapshot + '?format=json')
                 if rows is None:
+                    if expired:
+                        raise Pause('Snapshot deadline reached but download unavailable; resume to check the saved snapshot.')
                     continue
                 if isinstance(rows, dict) and rows.get('status') in WAITING:
+                    if expired:
+                        self.failed_attempt(task, attempt, 'Snapshot still building after the 20 minute collection deadline.')
+                        continue
                     task['nextAttemptAt'] = time.time() + self.poll_interval
                     self.save(task)
                     continue
@@ -311,7 +320,7 @@ class Runner:
                         'dataset_id': route['datasetId'], 'include_errors': 'true', 'format': 'json'}),
                         route, payload_for(task['prompt']['text'], route))
                 except HTTPFailure as error:
-                    if error.code != 408:
+                    if 400 <= error.code < 500 and error.code != 408:
                         self.failed_attempt(task, attempt, str(error))
                         self.defer(task, error, len(attempts))
                         continue
@@ -344,7 +353,7 @@ class Runner:
             try:
                 raw = self.request('POST', url, fallback, payload)
             except HTTPFailure as error:
-                if error.code != 408:
+                if 400 <= error.code < 500 and error.code != 408:
                     api_attempt.update(status='Error', error=str(error))
                     task['status'] = 'Pending'
                     self.defer(task, error, len(api_attempts))

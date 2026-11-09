@@ -75,10 +75,13 @@ Task state and original responses are saved as atomic JSON files. The runner:
 
 - Saves each snapshot ID before polling, and resumes the saved snapshot after a
   restart. Running or building snapshots are polled again rather than resubmitted.
-- Retries failed snapshots, error/empty records, provider error pages and HTTP
-  rejections. Three consecutive failed poll/download requests fail that collection
-  attempt. A snapshot has a 20-minute deadline that survives restarts. These
+- Retries failed snapshots, error/empty records, provider error pages and explicit
+  HTTP 4xx rejections (except 408). Failed poll/download requests retry the same
+  snapshot with backoff. A snapshot has a 20-minute deadline that survives restarts. These
   snapshots are retained in task history; the remote job may still finish.
+  On resume, even an expired snapshot is checked for a finished result before a
+  new collection is submitted. Unavailable progress/download reads pause it for
+  a later resume rather than discarding a possibly finished result.
 - Saves backoff deadlines, honors `Retry-After`, and retains failed attempts.
 - Uses one durable HTTP request cap shared by all five workers. **Every trigger,
   poll, download and fallback request counts**, including retries. `maxRequests`
@@ -88,7 +91,7 @@ Task state and original responses are saved as atomic JSON files. The runner:
 - Holds a local OS lock for the output folder, preventing two processes from
   running the same round concurrently. The lock is released after a crash.
 
-If a POST times out, loses its connection, returns HTTP 408, or collection is
+If a POST times out, loses its connection, returns HTTP 408 or 5xx, or collection is
 interrupted before the response is saved, its status is `SubmissionUnknown`.
 It is **not automatically resubmitted or sent to fallback**, because the provider
 may already have accepted and billed it. Check provider history first. These

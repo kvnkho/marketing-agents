@@ -169,6 +169,27 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(len(self.task()['apiAttempts']), 3)
         self.assertNotIn('answer', self.task())
 
+    def test_malformed_source_lists_fail_collection_attempt_instead_of_aborting_run(self):
+        r = self.runner()
+        downloads = iter([[{'answer_text': 'Answer', 'citations': 42}],
+                          [{'answer_text': 'Another answer', 'sources': {'url': 'https://example.com'}}],
+                          [{'answer_text': 'Third answer', 'search_sources': 'invalid'}]])
+        def request(method, url, route, payload=None):
+            if '/trigger?' in url:
+                return {'snapshot_id': 's'}
+            if '/progress/' in url:
+                return {'status': 'ready'}
+            if '/snapshot/' in url:
+                return next(downloads)
+            return {'status': 'completed', 'output': [{'type': 'message', 'content': [
+                {'type': 'output_text', 'text': 'Valid API answer'}]}]}
+        r.request = request
+        self.assertEqual(self.work(r), 'Captured')
+        task = self.task()
+        self.assertEqual(task['answer'], 'Valid API answer')
+        self.assertEqual(len(task['brightDataAttempts']), 3)
+        self.assertEqual(task['brightDataAttempts'][0]['raw'][0]['citations'], 42)
+
     def test_five_workers_and_shared_request_cap(self):
         manifest = run.manifest_for(workspace(12), 'p', [self.route], 1)
         r = self.runner({'maxRequests': 5}, manifest)
@@ -244,16 +265,14 @@ class CollectionTests(unittest.TestCase):
         self.assertGreater(task['nextAttemptAt'], time.time() + 115)
         self.assertNotIn(self.env['OPENAI_API_KEY'], (self.out / 'fixture.json').read_text())
 
-    def test_http_rejections_and_failed_reads_reach_fallback(self):
-        for failure in ('trigger', 'progress'):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+    def test_explicit_rejections_reach_fallback(self):
+        for code in (401, 429):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 self.out = Path(directory)
                 r = self.runner()
                 def request(method, url, route, payload=None):
-                    if f'/{failure}' in url:
-                        raise bd.HTTPFailure(503)
                     if '/trigger?' in url:
-                        return {'snapshot_id': 's'}
+                        raise bd.HTTPFailure(code)
                     return {'status': 'completed', 'output': [{'type': 'message', 'content': [
                         {'type': 'output_text', 'text': 'Fallback after unavailable scraper'}]}]}
                 r.request = request
@@ -261,24 +280,93 @@ class CollectionTests(unittest.TestCase):
                 self.assertTrue(self.task()['fallbackUsed'])
                 self.assertEqual(len(self.task()['brightDataAttempts']), 3)
 
-    def test_snapshot_deadline_survives_restart(self):
+    def test_repeated_poll_errors_keep_same_snapshot(self):
+        r = self.runner()
+        responses = iter([{'snapshot_id': 's'}, bd.HTTPFailure(503), bd.HTTPFailure(503),
+                          bd.HTTPFailure(503), {'status': 'ready'}, [{'answer_text': 'Recovered'}]])
+        methods = []
+        def request(method, *args):
+            methods.append(method)
+            value = next(responses)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        r.request = request
+        self.assertEqual(self.work(r), 'Captured')
+        self.assertEqual(methods.count('POST'), 1)
+        self.assertEqual(len(self.task()['brightDataAttempts']), 1)
+
+    def test_post_server_error_is_held_without_resubmission(self):
+        r = self.runner()
+        calls = []
+        def request(*args):
+            calls.append(args)
+            raise bd.HTTPFailure(502)
+        r.request = request
+        self.assertEqual(self.work(r), 'SubmissionUnknown')
+        self.assertEqual(self.work(self.runner()), 'SubmissionUnknown')
+        self.assertEqual(len(calls), 1)
+
+    def test_expired_snapshot_is_downloaded_on_resume_if_ready(self):
         r = self.runner({'maxRequests': 1})
         r.request = lambda *args: {'snapshot_id': 's'}
         self.work(r)
         task = self.task()
         task['brightDataAttempts'][0]['submittedAt'] = 0
         r.save(task)
-        resumed = self.runner({'maxRequests': 2})
-        resumed.request = lambda *args: {'snapshot_id': 'next'}
+        resumed = self.runner({'maxRequests': 3})
+        def request(method, url, route, payload=None):
+            self.assertEqual(method, 'GET')
+            return {'status': 'ready'} if '/progress/' in url else [{'answer_text': 'Finished while asleep'}]
+        resumed.request = request
+        self.assertEqual(self.work(resumed), 'Captured')
+        self.assertEqual(len(self.task()['brightDataAttempts']), 1)
+
+    def test_expired_snapshot_still_running_fails_only_after_progress_check(self):
+        r = self.runner({'maxRequests': 1})
+        r.request = lambda *args: {'snapshot_id': 's'}
+        self.work(r)
+        task = self.task()
+        task['brightDataAttempts'][0]['submittedAt'] = 0
+        r.save(task)
+        resumed = self.runner({'maxRequests': 3})
+        calls = []
+        def request(method, url, route, payload=None):
+            calls.append(method)
+            return {'status': 'running'} if method == 'GET' else {'snapshot_id': 'next'}
+        resumed.request = request
         self.work(resumed)
+        self.assertEqual(calls, ['GET', 'POST'])
         self.assertEqual(self.task()['brightDataAttempts'][0]['status'], 'Error')
         self.assertEqual(self.task()['brightDataAttempts'][1]['snapshotId'], 'next')
+
+    def test_truncated_http_response_is_retried_on_same_snapshot(self):
+        import http.client
+        from unittest.mock import MagicMock
+        r = self.runner()
+        def response(value):
+            context = MagicMock()
+            context.__enter__.return_value.read.return_value = json.dumps(value).encode()
+            return context
+        truncated = MagicMock()
+        truncated.__enter__.return_value.read.side_effect = http.client.IncompleteRead(b'{"status":')
+        with patch.object(bd.urllib.request, 'urlopen', side_effect=[
+                response({'snapshot_id': 's'}), truncated, response({'status': 'ready'}),
+                response([{'answer_text': 'Recovered transport'}])]) as calls:
+            self.assertEqual(self.work(r), 'Captured')
+        self.assertEqual(sum(call.args[0].method == 'POST' for call in calls.call_args_list), 1)
+
+    def test_truncated_post_is_held(self):
+        import http.client
+        r = self.runner()
+        with patch.object(bd.urllib.request, 'urlopen', side_effect=http.client.BadStatusLine('truncated')):
+            self.assertEqual(self.work(r), 'SubmissionUnknown')
 
     def test_api_attempt_budget_and_interrupted_fallback_survive_restart(self):
         r = self.runner({'maxRequests': 4})
         def request(method, url, route, payload=None):
             if '/trigger?' in url:
-                raise bd.HTTPFailure(503)
+                raise bd.HTTPFailure(429)
             return {'status': 'incomplete', 'output': []}
         r.request = request
         self.assertEqual(self.work(r), 'Pending')
